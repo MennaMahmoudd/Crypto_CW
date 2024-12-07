@@ -11,7 +11,11 @@ from docx import Document
 from PyPDF2 import PdfReader, PdfWriter
 from pptx import Presentation
 import openpyxl
-
+import tempfile
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import PKCS1_OAEP
+from Crypto.Cipher import DES, PKCS1_OAEP
+import socket
 
 USER_DATA_FILE = "users.txt"
 UPLOADS_DIR = "uploads"  # Directory to store uploaded files
@@ -30,26 +34,46 @@ def clear_ui():
         widget.pack_forget()
     current_widgets.clear()
 
-# Function to hash passwords
-def hash_password(password):
-    return hashlib.sha256(password.encode()).hexdigest()
+# Function to generate a salt
+def generate_salt():
+    return os.urandom(16)  # Generates a random salt of 16 bytes
 
-# Function to save user data
-def save_user(username, hashed_password):
+# Function to hash password with a salt
+def hash_password(password, salt):
+    return hashlib.sha256(salt + password.encode()).hexdigest()
+
+# Function to save user data (username, hashed password, and salt)
+def save_user(username, hashed_password, salt):
     with open(USER_DATA_FILE, "a") as file:
-        file.write(f"{username},{hashed_password}\n")
+        file.write(f"{username},{hashed_password},{salt.hex()}\n")
 
-# Function to verify username and password
+
 def verify_user(username, password):
     if not os.path.exists(USER_DATA_FILE):
         return False  # No users file yet
-    hashed_input_password = hash_password(password)
+
     with open(USER_DATA_FILE, "r") as file:
         for line in file:
-            saved_username, saved_password = line.strip().split(",")
-            if username == saved_username and hashed_input_password == saved_password:
-                return True
+            line = line.strip()
+            if not line:  # Skip empty lines
+                continue
+            parts = line.split(",")
+            
+            if len(parts) != 3:
+                print(f"Skipping invalid line: {line}")  # Log invalid lines for debugging
+                continue  # Skip lines that don't have exactly 3 parts
+            
+            saved_username, saved_hashed_password, saved_salt = parts
+            if username == saved_username:
+                salt = bytes.fromhex(saved_salt)  # Convert the salt back from hex
+                hashed_input_password = hash_password(password, salt)
+                if hashed_input_password == saved_hashed_password:
+                    return True
+
     return False
+
+
+
 
 # Function to validate password complexity
 def is_password_complex(password):
@@ -81,11 +105,12 @@ def signup():
         )
         return
 
-    hashed_password = hash_password(password)
-    save_user(username, hashed_password)
+    salt = generate_salt()  # Generate a salt for the user
+    hashed_password = hash_password(password, salt)  # Hash the password with the salt
+    save_user(username, hashed_password, salt)
     messagebox.showinfo("Signup Success", "Account created successfully! Please log in now.")
-    
-     # Clear the username and password fields
+
+    # Clear the username and password fields
     entry_username.delete(0, tk.END)
     entry_password.delete(0, tk.END)
     show_login_screen()
@@ -105,7 +130,6 @@ def login():
     else:
         messagebox.showerror("Login Failed", "Invalid username or password! Please sign up if you don't have an account.")
         entry_password.delete(0, tk.END)
-
 # Function to show login screen
 def show_login_screen():
     clear_ui()
@@ -192,38 +216,33 @@ def upload_file():
         encryption_key = encrypt_file(file_path, destination)
         messagebox.showinfo("File Upload", f"File '{file_name}' uploaded successfully!")
         
-# Function to show uploaded files
+# Function to show uploaded files as clickable buttons
 def show_uploaded_files():
     clear_ui()
     label_title.config(text="Uploaded Files", font=("Helvetica", 18))
     label_title.pack(pady=10)
     current_widgets.append(label_title)
 
-    # Get the list of uploaded files
-    uploaded_files = os.listdir(UPLOADS_DIR)
+    # Get the list of uploaded files (excluding .key files)
+    uploaded_files = [file for file in os.listdir(UPLOADS_DIR) if not file.endswith(".key")]
+    
     if not uploaded_files:
         messagebox.showinfo("No Files", "No files have been uploaded yet.")
         show_upload_screen()
         return
 
-    # Display uploaded files
-    for file in uploaded_files:
-        file_label = tk.Label(root, text=file, font=("Helvetica", 12))
-        file_label.pack(pady=5)
-        current_widgets.append(file_label)
-        
-      # Display uploaded files as clickable buttons
+    # Display uploaded files as clickable buttons
     for file in uploaded_files:
         file_button = tk.Button(root, text=file, font=("Helvetica", 12), command=lambda file=file: file_options(file))
         file_button.pack(pady=5)
         current_widgets.append(file_button)
-        
-
 
     # Back button to go back to the upload screen
     button_back = tk.Button(root, text="Back", command=show_upload_screen, font=("Helvetica", 12))
     button_back.pack(pady=10)
     current_widgets.append(button_back)
+
+
     
 # Function to handle the options for a selected file
 def file_options(file_name):
@@ -279,17 +298,25 @@ def rename_file(file_name):
         
         old_path = os.path.join(UPLOADS_DIR, file_name)
         new_path = os.path.join(UPLOADS_DIR, new_name)
+        old_key_path = old_path + ".key"
+        new_key_path = new_path + ".key"
 
         if os.path.exists(new_path):
             messagebox.showwarning("File Exists", f"A file with the name '{new_name}' already exists.")
             return
 
         try:
+            # Rename the file
             os.rename(old_path, new_path)
+            # Rename the key file, if it exists
+            if os.path.exists(old_key_path):
+                os.rename(old_key_path, new_key_path)
             messagebox.showinfo("File Renamed", f"The file has been renamed to '{new_name}' successfully!")
             show_uploaded_files()  # Refresh the file list
         except Exception as e:
             messagebox.showerror("Error", f"An error occurred while renaming the file: {str(e)}")
+    
+
     
     clear_ui()
 
@@ -315,145 +342,128 @@ def rename_file(file_name):
     button_cancel.pack(pady=10)
     current_widgets.append(button_cancel)
     
-# Function to edit a file in a new window
 def edit_file_in_window(file_name):
+    clear_ui()
     label_title.config(text=f"Edit File: {file_name}", font=("Helvetica", 18))
+    label_title.pack(pady=10)
+    current_widgets.append(label_title)
 
     file_path = os.path.join(UPLOADS_DIR, file_name)
+    key_file_path = file_path + ".key"  # Path to the encryption key file
 
-    # Check if the file is a .docx, .pdf, .pptx, or .xlsx file and handle accordingly
-    if file_name.endswith(".docx"):
-        try:
-            doc = Document(file_path)
+    # Create a temporary directory for decrypted files
+    temp_dir = tempfile.mkdtemp()
+    decrypted_file_path = os.path.join(temp_dir, file_name)
+
+    # Decrypt the file before opening
+    try:
+        decrypt_file(file_path, key_file_path, decrypted_file_path)
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to decrypt file: {e}")
+        show_uploaded_files()
+        return
+
+    # Attempt to load the decrypted file
+    try:
+        if file_name.endswith(".docx"):
+            doc = Document(decrypted_file_path)
             content = "\n".join([para.text for para in doc.paragraphs])
-        except Exception as e:
-            messagebox.showerror("Error", f"Unable to open DOCX file: {e}")
-            show_uploaded_files()
-            return
-    elif file_name.endswith(".pdf"):
-        try:
-            pdf_reader = PdfReader(file_path)
+        elif file_name.endswith(".pdf"):
+            pdf_reader = PdfReader(decrypted_file_path)
             content = "\n".join([page.extract_text() for page in pdf_reader.pages])
-        except Exception as e:
-            messagebox.showerror("Error", f"Unable to open PDF file: {e}")
-            show_uploaded_files()
-            return
-    elif file_name.endswith(".pptx"):
-        try:
-            prs = Presentation(file_path)
+        elif file_name.endswith(".pptx"):
+            prs = Presentation(decrypted_file_path)
             content = "\n".join([slide.shapes.title.text if slide.shapes.title else '' for slide in prs.slides])
-        except Exception as e:
-            messagebox.showerror("Error", f"Unable to open PowerPoint file: {e}")
-            show_uploaded_files()
-            return
-    elif file_name.endswith(".xlsx"):
-        try:
-            wb = openpyxl.load_workbook(file_path)
+        elif file_name.endswith(".xlsx"):
+            wb = openpyxl.load_workbook(decrypted_file_path)
             sheet = wb.active
             content = "\n".join([str(cell.value) for row in sheet.iter_rows() for cell in row])
-        except Exception as e:
-            messagebox.showerror("Error", f"Unable to open Excel file: {e}")
-            show_uploaded_files()
-            return
-    else:
-        content = ""
-   
-   
-       # Create a Text widget to display the file content
+        else:
+            content = ""
+    except Exception as e:
+        messagebox.showerror("Error", f"Failed to open file: {e}")
+        show_uploaded_files()
+        return
+
+    # Display content in a Text widget for editing
     text_edit = tk.Text(root, wrap=tk.WORD, height=15, width=40)
     text_edit.insert(tk.END, content)
     text_edit.pack(pady=10)
+    current_widgets.append(text_edit)
 
-    def save_edits():
+    # Save edits back to the encrypted file
+    def save_edits_and_exit():
         new_content = text_edit.get("1.0", tk.END).strip()
-        if file_name.endswith(".docx"):
-            try:
-                doc = Document(file_path)
-                for para in doc.paragraphs:
-                    para.clear()  # Clear existing content
+
+        try:
+            if file_name.endswith(".docx"):
+                doc = Document()
                 doc.add_paragraph(new_content)
-                doc.save(file_path)
-                messagebox.showinfo("Edit Success", f"File '{file_name}' edited successfully!")
-                messagebox.showinfo("Program Close", "File successfully saved and program will now close.")
-                root.quit()  # This will close the Tkinter application
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save DOCX edits: {e}")
-        elif file_name.endswith(".pdf"):
-            try:
+                doc.save(decrypted_file_path)
+            elif file_name.endswith(".pdf"):
                 pdf_writer = PdfWriter()
-                pdf_reader = PdfReader(file_path)
+                pdf_reader = PdfReader(decrypted_file_path)
                 for page in pdf_reader.pages:
                     pdf_writer.add_page(page)
-                # Add new content to the first page (example)
-                pdf_writer.pages[0].extract_text()  # You need to modify content here for editing
-                with open(file_path, 'wb') as f:
+                # Modify content as needed
+                with open(decrypted_file_path, 'wb') as f:
                     pdf_writer.write(f)
-                messagebox.showinfo("Edit Success", f"File '{file_name}' edited successfully!")
-                messagebox.showinfo("Program Close", "File successfully saved and program will now close.")
-                root.quit()  # This will close the Tkinter application
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save PDF edits: {e}")
-        elif file_name.endswith(".pptx"):
-            try:
-                prs = Presentation(file_path)
-                # Update presentation content with new content
-                prs.slides[0].shapes.title.text = new_content  # Modify as needed
-                prs.save(file_path)
-                messagebox.showinfo("Edit Success", f"File '{file_name}' edited successfully!")
-                messagebox.showinfo("Program Close", "File successfully saved and program will now close.")
-                root.quit()  # This will close the Tkinter application
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save PowerPoint edits: {e}")
-        elif file_name.endswith(".xlsx"):
-            try:
-                wb = openpyxl.load_workbook(file_path)
+            elif file_name.endswith(".pptx"):
+                prs = Presentation()
+                slide = prs.slides.add_slide(prs.slide_layouts[0])
+                if new_content:
+                    slide.shapes.title.text = new_content
+                prs.save(decrypted_file_path)
+            elif file_name.endswith(".xlsx"):
+                wb = openpyxl.Workbook()
                 sheet = wb.active
-                # Update Excel content with new content (simplified)
-                for row in sheet.iter_rows():
-                    for cell in row:
-                        cell.value = new_content  # Update cells with new content
-                wb.save(file_path)
-                messagebox.showinfo("Edit Success", f"File '{file_name}' edited successfully!")
-                      # Close the program after saving
-                messagebox.showinfo("Program Close", "File successfully saved and program will now close.")
-                root.quit()  # This will close the Tkinter application
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to save Excel edits: {e}")
+                rows = new_content.splitlines()
+                for i, row in enumerate(rows, start=1):
+                    sheet[f"A{i}"] = row
+                wb.save(decrypted_file_path)
 
+            # Encrypt and save the updated file
+            encrypt_file(decrypted_file_path, file_path)
+            messagebox.showinfo("Success", f"File '{file_name}' has been updated!")
+            root.destroy()  # Close the program after saving
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save edits: {e}")
 
-    # Save button to save the edits
-    button_save = tk.Button(root, text="Save Edits", command=save_edits, font=("Helvetica", 12))
+    # Add Save and Back buttons
+    button_save = tk.Button(root, text="Save Edits", command=save_edits_and_exit, font=("Helvetica", 12))
     button_save.pack(pady=10)
+    current_widgets.append(button_save)
 
-    # Back button to go back to the uploaded files list
     button_back = tk.Button(root, text="Back", command=show_uploaded_files, font=("Helvetica", 12))
     button_back.pack(pady=10)
+    current_widgets.append(button_back)
+
 
 
 def decrypt_file(encrypted_file_path, key_file_path, destination_path):
+    if not os.path.exists(encrypted_file_path):
+        raise FileNotFoundError(f"Encrypted file not found: {encrypted_file_path}")
+    if not os.path.exists(key_file_path):
+        raise FileNotFoundError(f"Key file not found: {key_file_path}")
+
     try:
         with open(encrypted_file_path, 'rb') as enc_file:
-            iv = enc_file.read(16)  # AES IV is 16 bytes
+            iv = enc_file.read(16)
             encrypted_data = enc_file.read()
 
-        # Retrieve the key
         with open(key_file_path, 'rb') as key_file:
             key = key_file.read()
 
-        # Use the correct IV and key for decryption
         cipher = AES.new(key, AES.MODE_CBC, iv)
-        
-        # Unpad the decrypted data
         decrypted_data = unpad(cipher.decrypt(encrypted_data), AES.block_size)
 
-        # Save the decrypted file
         with open(destination_path, 'wb') as dec_file:
             dec_file.write(decrypted_data)
 
         return True
     except Exception as e:
-        messagebox.showerror("Error", f"An error occurred while decrypting the file: {e}")
-        return False
+        raise RuntimeError(f"Decryption failed: {e}")
+
 
    
 
@@ -497,6 +507,98 @@ def download_decrypt_file(file_name):
 
 
 
+# Server address and port
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 12345
+
+# Load the server public key
+def load_server_public_key():
+    try:
+        with open('server_public_key.pem', 'rb') as key_file:
+            public_key = RSA.import_key(key_file.read())
+        return public_key
+    except Exception as e:
+        print(f"Error loading public key: {e}")
+        return None
+
+# Encrypt file using AES and the server's public RSA key
+def encrypt_file_aes(file_path):
+    try:
+        aes_key = get_random_bytes(32)  # Generate a random AES key (256 bits)
+        cipher = AES.new(aes_key, AES.MODE_CBC)
+
+        with open(file_path, 'rb') as f:
+            file_data = f.read()
+
+        # Pad data to be a multiple of 16 bytes (AES block size)
+        padded_data = pad(file_data, AES.block_size)
+        encrypted_data = cipher.encrypt(padded_data)
+        
+        # Save the encrypted data to a file
+        encrypted_file_path = file_path + ".enc"
+        with open(encrypted_file_path, 'wb') as f:
+            f.write(cipher.iv)  # Save the IV at the beginning of the file
+            f.write(encrypted_data)
+
+        # Load the server's public key
+        server_public_key = load_server_public_key()
+        if server_public_key is None:
+            raise Exception("Failed to load server public key.")
+
+        # Encrypt the AES key using the server's public key
+        rsa_cipher = PKCS1_OAEP.new(server_public_key)
+        encrypted_aes_key = rsa_cipher.encrypt(aes_key)
+
+        return encrypted_file_path, encrypted_aes_key
+    except Exception as e:
+        print(f"Error during encryption: {e}")
+        return None, None
+
+# Function to upload and encrypt the file
+def Upload_file():
+    file_path = filedialog.askopenfilename(title="Select a file")
+    if not file_path or not os.path.exists(file_path):
+        messagebox.showwarning("File Selection", "No file selected or file does not exist.")
+        return
+
+    encrypted_file_path, encrypted_aes_key = encrypt_file_aes(file_path)
+    if encrypted_file_path and encrypted_aes_key:
+        messagebox.showinfo("File Encryption", f"File encrypted successfully: {encrypted_file_path}")
+        send_file_to_server(encrypted_file_path, encrypted_aes_key)
+    else:
+        messagebox.showerror("Encryption Error", "Failed to encrypt the file.")
+
+# Function to send the encrypted file to the server
+def send_file_to_server(encrypted_file_path, encrypted_aes_key):
+    try:
+        # Create a socket connection to the server
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect((SERVER_HOST, SERVER_PORT))
+
+            # Send the file name length (4 bytes)
+            file_name = os.path.basename(encrypted_file_path)
+            file_name_length = len(file_name).to_bytes(4, byteorder='big')
+            s.sendall(file_name_length)
+
+            # Send the file name
+            s.sendall(file_name.encode('utf-8'))
+
+            # Send the encrypted AES key (length first)
+            s.sendall(len(encrypted_aes_key).to_bytes(4, byteorder='big'))  # Send the length of the AES key
+            s.sendall(encrypted_aes_key)
+
+            # Send the encrypted file data
+            with open(encrypted_file_path, 'rb') as file:
+                while True:
+                    file_data = file.read(4096)
+                    if not file_data:
+                        break
+                    s.sendall(file_data)
+
+            print("File sent to server successfully!")
+    except Exception as e:
+        print(f"Failed to send file: {str(e)}")
+
 
 
 # Function to show file upload screen with options
@@ -510,6 +612,11 @@ def show_upload_screen():
     button_upload = tk.Button(root, text="Upload a File", command=upload_file, font=("Helvetica", 12))
     button_upload.pack(pady=10)
     current_widgets.append(button_upload)
+    
+    
+    button_share = tk.Button(root, text="Select a file to share",command=Upload_file ,font=("Helvetica", 12))
+    button_share.pack(pady=10)
+    current_widgets.append(button_share)
 
     # Option to show uploaded files
     button_show_files = tk.Button(root, text="Show Uploaded Files", command=show_uploaded_files, font=("Helvetica", 12))
